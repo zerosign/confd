@@ -15,6 +15,7 @@ import (
 
 func main() {
 	flag.Parse()
+
 	if config.PrintVersion {
 		fmt.Printf("confd %s (Git SHA: %s, Go Version: %s)\n", Version, GitSHA, runtime.Version())
 		os.Exit(0)

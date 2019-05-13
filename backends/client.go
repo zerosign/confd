@@ -16,6 +16,7 @@ import (
 	"github.com/kelseyhightower/confd/backends/vault"
 	"github.com/kelseyhightower/confd/backends/zookeeper"
 	"github.com/kelseyhightower/confd/log"
+	"strconv"
 )
 
 // The StoreClient interface is implemented by objects that can retrieve
@@ -27,7 +28,6 @@ type StoreClient interface {
 
 // New is used to create a storage client based on our configuration.
 func New(config Config) (StoreClient, error) {
-
 	if config.Backend == "" {
 		config.Backend = "etcd"
 	}
@@ -77,6 +77,8 @@ func New(config Config) (StoreClient, error) {
 			"key":       config.ClientKey,
 			"caCert":    config.ClientCaKeys,
 			"path":      config.Path,
+			// to be used for dynamic secret lifecycle
+			"interval": strconv.Itoa(config.BackendInterval),
 		}
 		return vault.New(backendNodes[0], config.AuthType, vaultConfig)
 	case "dynamodb":

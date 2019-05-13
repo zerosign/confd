@@ -1,22 +1,139 @@
 package vault
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	vaultapi "github.com/hashicorp/vault/api"
+	"github.com/kelseyhightower/confd/log"
 	"io/ioutil"
 	"net/http"
 	"path"
-
-	vaultapi "github.com/hashicorp/vault/api"
-	"github.com/kelseyhightower/confd/log"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
+type secretVault struct {
+	key     string
+	secret  *vaultapi.Secret
+	created time.Time
+}
+
+//
+// Lifecycle management of vault dynamic secret
+//
+type secretLifecycle struct {
+	client   *vaultapi.Client
+	data     map[string]atomic.Value
+	lock     *sync.RWMutex
+	interval int
+}
+
+// extend lease id ~ renew lease id
+func (s *secretLifecycle) Extend(id string) (err error) {
+	secret := s.data[id]
+	renewer, err := s.client.NewRenewer(&vaultapi.RenewerInput{
+		Secret: secret.Load().(*vaultapi.Secret),
+	})
+
+	go renewer.Renew()
+	defer renewer.Stop()
+
+	// just do blocking logic in here since
+	// we have our own global ticker that renew everything elses
+	select {
+	case err = <-renewer.DoneCh():
+		return err
+
+	case renewal := <-renewer.RenewCh():
+		log.Info("Secret with id: %#v succesfully renewed", id)
+
+		value := s.data[id]
+		secret := value.Load().(secretVault)
+		value.Store(secretVault{secret.key, renewal.Secret, renewal.RenewedAt})
+		return nil
+	}
+}
+
+// renew credential
+func (s *secretLifecycle) Renew(id string) (err error) {
+	s.lock.Lock()
+	value := s.data[id]
+	secret := value.Load().(secretVault)
+	newSecret, err := s.client.Logical().Read(secret.key)
+
+	if err != nil {
+		return err
+	}
+
+	delete(s.data, id)
+	value = atomic.Value{}
+	value.Store(secretVault{secret.key, newSecret, time.Now()})
+	s.data[newSecret.LeaseID] = value
+
+	s.lock.Unlock()
+
+	return nil
+}
+
+func (s *secretLifecycle) Handle(ctx context.Context) (quit chan struct{}) {
+	// TODO: handle secret lifecycle
+	ticker := time.NewTicker(time.Duration(s.interval) * time.Second)
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				// do something
+				// for all dynamic secrets do extend in parallel
+				var wg sync.WaitGroup
+				wg.Add(len(s.data))
+
+				for k, value := range s.data {
+					go func() {
+						secret := value.Load().(secretVault)
+						if secret.secret.Renewable {
+							s.Extend(k)
+						}
+						// TODO add s.Renew
+						wg.Done()
+					}()
+				}
+				wg.Wait()
+
+			case <-quit:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+
+	return quit
+}
+
 // Client is a wrapper around the vault client
+//
+// We will use IntervalProcessor as frontends to our
+// vault dynamic secret lifecycle.
+//
+// Apparently, StoreClient impl are being shared accross
+// TemplateResource instance, so we could implement dynamic secret engine
+// by piggy-backing this Client struct.
+//
 type Client struct {
-	client *vaultapi.Client
+	lifecycle secretLifecycle
+	client    *vaultapi.Client
+	// cache (dynamics) here is important since if you read more than once to
+	// dynamic secret, it will generate new credential data for you
+	// { path => value }
+	dynamicSecrets map[string]atomic.Value
+	lock           sync.RWMutex
 }
 
 // get a
@@ -168,7 +285,54 @@ func New(address, authType string, params map[string]string) (*Client, error) {
 	if err := authenticate(c, authType, params); err != nil {
 		return nil, err
 	}
-	return &Client{c}, nil
+
+	data := make(map[string]atomic.Value)
+	lock := sync.RWMutex{}
+
+	// spawn background thread that checks
+	interval, err := strconv.Atoi(params["interval"])
+
+	if err != nil {
+		return nil, err
+	}
+
+	lifecycle := secretLifecycle{c, data, &lock, interval}
+
+	go lifecycle.Handle(context.Background())
+
+	return &Client{lifecycle, c, data, lock}, nil
+}
+
+//
+// Vault credential paths
+//
+// sadly, there were no exact global variable path for credential in
+// vault. Most creds pattern are just being implemented directly in each plugin.
+//
+// example: https://github.com/hashicorp/vault/blob/278bdd1f4e3ca4653f4a11d8591ecebeafb196bd/builtin/logical/mongodb/path_creds_create.go#L14
+//
+func isCredential(key string) bool {
+	paths := strings.Split(key, "/")
+	return len(paths) > 2 && paths[1] == "creds"
+}
+
+//
+// Get secret from (in order) :
+// - dynamic secrets if is credential
+// - read from vault api directly
+//
+func (c *Client) getSecret(key string) (secret *vaultapi.Secret, err error) {
+	if isCredential(key) {
+		if value, ok := c.dynamicSecrets[key]; ok {
+			secret = value.Load().(*vaultapi.Secret)
+		} else {
+			secret, err = c.client.Logical().Read(key)
+		}
+	} else {
+		secret, err = c.client.Logical().Read(key)
+	}
+
+	return secret, err
 }
 
 // GetValues queries etcd for keys prefixed by prefix.
@@ -179,27 +343,29 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 	}
 	vars := make(map[string]string)
 	for key := range branches {
+
 		log.Debug("getting %s from vault", key)
-		resp, err := c.client.Logical().Read(key)
+
+		secret, err := c.getSecret(key)
 
 		if err != nil {
 			log.Debug("there was an error extracting %s", key)
 			return nil, err
 		}
-		if resp == nil || resp.Data == nil {
+		if secret == nil || secret.Data == nil {
 			continue
 		}
 
 		// if the key has only one string value
 		// treat it as a string and not a map of values
-		if val, ok := isKV(resp.Data); ok {
+		if val, ok := isKV(secret.Data); ok {
 			vars[key] = val
 		} else {
 			// save the json encoded response
 			// and flatten it to allow usage of gets & getvs
-			js, _ := json.Marshal(resp.Data)
+			js, _ := json.Marshal(secret.Data)
 			vars[key] = string(js)
-			flatten(key, resp.Data, vars)
+			flatten(key, secret.Data, vars)
 		}
 	}
 	return vars, nil
