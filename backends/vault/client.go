@@ -98,6 +98,16 @@ func (s *secretLifecycle) Handle(ctx context.Context) (quit chan struct{}) {
 				for k, value := range s.data {
 					go func() {
 						secret := value.Load().(secretVault)
+						data := map[string]string{"lease_id": secret.secret.LeaseID}
+
+						//
+						// You know what I confuse on how vault abstract their code flows or maybe I'm not just
+						// into Go language anymore.
+						//
+						// TODO: checks whether PUT request for "sys/leases/lookup" do mutation or not in the code
+						//       and what the returns of this thing
+						// fsecret, err := s.client.Logical().Write("sys/leases/lookup", data); err == nil && fsecret != nil {
+
 						if secret.secret.Renewable {
 							s.Extend(k)
 						}
