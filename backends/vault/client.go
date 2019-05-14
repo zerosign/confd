@@ -25,6 +25,10 @@ type secretVault struct {
 	created time.Time
 }
 
+func (s *secretVault) IsValid() bool {
+	return s.created.Before(time.Now())
+}
+
 //
 // Lifecycle management of vault dynamic secret
 //
@@ -82,43 +86,104 @@ func (s *secretLifecycle) Renew(id string) (err error) {
 	return nil
 }
 
+//
+// Note: format time from vault
+//
+// 2017-04-30T10:18:11.228946471-04:00
+//
+type leaseMetadata struct {
+	Id              string        `json:"id"`
+	IssueTime       time.Time     `json:"issue_time"`
+	ExpireTime      time.Time     `json:"expire_time"`
+	LastRenewalTime time.Time     `json:"last_renewal_time,omitempty"`
+	Renewable       bool          `json:"renewable"`
+	Ttl             time.Duration `json:"ttl"`
+}
+
+func (s *secretLifecycle) IsValid(id string) bool {
+	value := s.data[id]
+	secret := value.Load().(secretVault)
+	return secret.IsValid()
+}
+
+//
+// Check lease id validity
+//
+// see: https://www.vaultproject.io/api/system/leases.html#sys-leases
+//
+// any errors will returns false (including network error)
+//
+func (s *secretLifecycle) IsRemoteValid(id string) bool {
+	var metadata leaseMetadata
+
+	request := s.client.NewRequest("PUT", "/v1/sys/leases/lookup")
+
+	if err := request.SetJSONBody(map[string]interface{}{
+		"lease_id": id,
+	}); err != nil {
+		log.Error("%v, malformed JSONBody for leases/lookup %v", err, id)
+
+		return false
+	}
+
+	response, err := s.client.RawRequest(request)
+
+	if err != nil {
+		log.Error("%v, can't create raw request for leases/lookup %v", err, id)
+		return false
+	}
+
+	err = json.NewDecoder(response.Body).Decode(&metadata)
+
+	if err != nil {
+		log.Error("%v, invalid response when fetching leases/lookup %v", err, id)
+		return false
+	}
+
+	// check whether the time is still valid or not
+	return metadata.ExpireTime.Before(time.Now())
+}
+
 func (s *secretLifecycle) Handle(ctx context.Context) (quit chan struct{}) {
-	// TODO: handle secret lifecycle
+
 	ticker := time.NewTicker(time.Duration(s.interval) * time.Second)
+
+	lifecycle := func(id string, secret *secretVault, life *secretLifecycle, wg *sync.WaitGroup) {
+
+		if secret.secret.Renewable {
+			wg.Done()
+			return
+		}
+
+		if secret.IsValid() && s.IsRemoteValid(id) {
+			// since this still valid then extend the leases
+			log.Debug("try extending %v succeed", id)
+			s.Extend(id)
+			log.Debug("extending %v succeed", id)
+		} else {
+			log.Debug("try renewing credential for %v", id)
+			s.Renew(id)
+			log.Debug("renewing credential for %v succeed", id)
+		}
+
+		wg.Done()
+	}
 
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
-				// do something
-				// for all dynamic secrets do extend in parallel
 				var wg sync.WaitGroup
 				wg.Add(len(s.data))
-
-				for k, value := range s.data {
-					go func() {
-						secret := value.Load().(secretVault)
-						data := map[string]string{"lease_id": secret.secret.LeaseID}
-
-						//
-						// You know what I confuse on how vault abstract their code flows or maybe I'm not just
-						// into Go language anymore.
-						//
-						// TODO: checks whether PUT request for "sys/leases/lookup" do mutation or not in the code
-						//       and what the returns of this thing
-						// fsecret, err := s.client.Logical().Write("sys/leases/lookup", data); err == nil && fsecret != nil {
-
-						if secret.secret.Renewable {
-							s.Extend(k)
-						}
-						// TODO add s.Renew
-						wg.Done()
-					}()
+				for id, value := range s.data {
+					secret := value.Load().(secretVault)
+					go lifecycle(id, &secret, s, &wg)
 				}
 				wg.Wait()
-
 			case <-quit:
+				log.Info("stopping lifecycle goroutine")
 				ticker.Stop()
+				log.Info("lifecycle goroutine stopped")
 				return
 			}
 		}
