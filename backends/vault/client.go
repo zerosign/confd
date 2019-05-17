@@ -1,217 +1,28 @@
 package vault
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
-	vaultapi "github.com/hashicorp/vault/api"
+	v "github.com/hashicorp/vault/api"
 	"github.com/kelseyhightower/confd/log"
 	"io/ioutil"
 	"net/http"
 	"path"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
-type secretVault struct {
-	key     string
-	secret  *vaultapi.Secret
-	created time.Time
-}
-
-func (s *secretVault) IsValid() bool {
-	return s.created.Before(time.Now())
-}
-
 //
-// Lifecycle management of vault dynamic secret
-//
-type secretLifecycle struct {
-	client   *vaultapi.Client
-	data     map[string]atomic.Value
-	lock     *sync.RWMutex
-	interval int
-}
-
-// extend lease id ~ renew lease id
-func (s *secretLifecycle) Extend(id string) (err error) {
-	secret := s.data[id]
-	renewer, err := s.client.NewRenewer(&vaultapi.RenewerInput{
-		Secret: secret.Load().(*vaultapi.Secret),
-	})
-
-	go renewer.Renew()
-	defer renewer.Stop()
-
-	// just do blocking logic in here since
-	// we have our own global ticker that renew everything elses
-	select {
-	case err = <-renewer.DoneCh():
-		return err
-
-	case renewal := <-renewer.RenewCh():
-		log.Info("Secret with id: %#v succesfully renewed", id)
-
-		value := s.data[id]
-		secret := value.Load().(secretVault)
-		value.Store(secretVault{secret.key, renewal.Secret, renewal.RenewedAt})
-		return nil
-	}
-}
-
-// renew credential
-func (s *secretLifecycle) Renew(id string) (err error) {
-	s.lock.Lock()
-	value := s.data[id]
-	secret := value.Load().(secretVault)
-	newSecret, err := s.client.Logical().Read(secret.key)
-
-	if err != nil {
-		return err
-	}
-
-	delete(s.data, id)
-	value = atomic.Value{}
-	value.Store(secretVault{secret.key, newSecret, time.Now()})
-	s.data[newSecret.LeaseID] = value
-
-	s.lock.Unlock()
-
-	return nil
-}
-
-//
-// Note: format time from vault
-//
-// 2017-04-30T10:18:11.228946471-04:00
-//
-type leaseMetadata struct {
-	Id              string        `json:"id"`
-	IssueTime       time.Time     `json:"issue_time"`
-	ExpireTime      time.Time     `json:"expire_time"`
-	LastRenewalTime time.Time     `json:"last_renewal_time,omitempty"`
-	Renewable       bool          `json:"renewable"`
-	Ttl             time.Duration `json:"ttl"`
-}
-
-func (s *secretLifecycle) IsValid(id string) bool {
-	value := s.data[id]
-	secret := value.Load().(secretVault)
-	return secret.IsValid()
-}
-
-//
-// Check lease id validity
-//
-// see: https://www.vaultproject.io/api/system/leases.html#sys-leases
-//
-// any errors will returns false (including network error)
-//
-func (s *secretLifecycle) IsRemoteValid(id string) bool {
-	var metadata leaseMetadata
-
-	request := s.client.NewRequest("PUT", "/v1/sys/leases/lookup")
-
-	if err := request.SetJSONBody(map[string]interface{}{
-		"lease_id": id,
-	}); err != nil {
-		log.Error("%v, malformed JSONBody for leases/lookup %v", err, id)
-
-		return false
-	}
-
-	response, err := s.client.RawRequest(request)
-
-	if err != nil {
-		log.Error("%v, can't create raw request for leases/lookup %v", err, id)
-		return false
-	}
-
-	err = json.NewDecoder(response.Body).Decode(&metadata)
-
-	if err != nil {
-		log.Error("%v, invalid response when fetching leases/lookup %v", err, id)
-		return false
-	}
-
-	// check whether the time is still valid or not
-	return metadata.ExpireTime.Before(time.Now())
-}
-
-func (s *secretLifecycle) Handle(ctx context.Context) (quit chan struct{}) {
-
-	ticker := time.NewTicker(time.Duration(s.interval) * time.Second)
-
-	lifecycle := func(id string, secret *secretVault, life *secretLifecycle, wg *sync.WaitGroup) {
-
-		if secret.secret.Renewable {
-			wg.Done()
-			return
-		}
-
-		if secret.IsValid() && s.IsRemoteValid(id) {
-			// since this still valid then extend the leases
-			log.Debug("try extending %v succeed", id)
-			s.Extend(id)
-			log.Debug("extending %v succeed", id)
-		} else {
-			log.Debug("try renewing credential for %v", id)
-			s.Renew(id)
-			log.Debug("renewing credential for %v succeed", id)
-		}
-
-		wg.Done()
-	}
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				var wg sync.WaitGroup
-				wg.Add(len(s.data))
-				for id, value := range s.data {
-					secret := value.Load().(secretVault)
-					go lifecycle(id, &secret, s, &wg)
-				}
-				wg.Wait()
-			case <-quit:
-				log.Info("stopping lifecycle goroutine")
-				ticker.Stop()
-				log.Info("lifecycle goroutine stopped")
-				return
-			}
-		}
-	}()
-
-	return quit
-}
-
-// Client is a wrapper around the vault client
-//
-// We will use IntervalProcessor as frontends to our
-// vault dynamic secret lifecycle.
-//
-// Apparently, StoreClient impl are being shared accross
-// TemplateResource instance, so we could implement dynamic secret engine
-// by piggy-backing this Client struct.
+// Client will only holds lifecycles for this time
+// and let the underlying secret lifecycle handle
+// each lease renewal or credential renewal.
 //
 type Client struct {
-	lifecycle secretLifecycle
-	client    *vaultapi.Client
-	// cache (dynamics) here is important since if you read more than once to
-	// dynamic secret, it will generate new credential data for you
-	// { path => value }
-	dynamicSecrets map[string]atomic.Value
-	lock           sync.RWMutex
+	lifecycles map[string]SecretLifecycle
+	client     *v.Client
 }
 
-// get a
 func getParameter(key string, parameters map[string]string) string {
 	value := parameters[key]
 	if value == "" {
@@ -236,8 +47,8 @@ func panicToError(err *error) {
 }
 
 // authenticate with the remote client
-func authenticate(c *vaultapi.Client, authType string, params map[string]string) (err error) {
-	var secret *vaultapi.Secret
+func authenticate(c *v.Client, authType string, params map[string]string) (err error) {
+	var secret *v.Secret
 
 	// handle panics gracefully by creating an error
 	// this would happen when we get a parameter that is missing
@@ -308,8 +119,8 @@ func authenticate(c *vaultapi.Client, authType string, params map[string]string)
 	return nil
 }
 
-func getConfig(address, cert, key, caCert string) (*vaultapi.Config, error) {
-	conf := vaultapi.DefaultConfig()
+func getConfig(address, cert, key, caCert string) (*v.Config, error) {
+	conf := v.DefaultConfig()
 	conf.Address = address
 
 	tlsConfig := &tls.Config{}
@@ -341,7 +152,7 @@ func getConfig(address, cert, key, caCert string) (*vaultapi.Config, error) {
 
 // New returns an *vault.Client with a connection to named machines.
 // It returns an error if a connection to the cluster cannot be made.
-func New(address, authType string, params map[string]string) (*Client, error) {
+func New(address, authType string, dynamicSecrets []string, tollerance float64, params map[string]string) (*Client, error) {
 	if authType == "" {
 		return nil, errors.New("you have to set the auth type when using the vault backend")
 	}
@@ -352,7 +163,7 @@ func New(address, authType string, params map[string]string) (*Client, error) {
 		return nil, err
 	}
 
-	c, err := vaultapi.NewClient(conf)
+	c, err := v.NewClient(conf)
 	if err != nil {
 		return nil, err
 	}
@@ -361,53 +172,17 @@ func New(address, authType string, params map[string]string) (*Client, error) {
 		return nil, err
 	}
 
-	data := make(map[string]atomic.Value)
-	lock := sync.RWMutex{}
-
-	// spawn background thread that checks
-	interval, err := strconv.Atoi(params["interval"])
-
-	if err != nil {
-		return nil, err
-	}
-
-	lifecycle := secretLifecycle{c, data, &lock, interval}
-
-	go lifecycle.Handle(context.Background())
-
-	return &Client{lifecycle, c, data, lock}, nil
+	return &Client{NewLifecycle(c, dynamicSecrets, tollerance), c}, err
 }
 
-//
-// Vault credential paths
-//
-// sadly, there were no exact global variable path for credential in
-// vault. Most creds pattern are just being implemented directly in each plugin.
-//
-// example: https://github.com/hashicorp/vault/blob/278bdd1f4e3ca4653f4a11d8591ecebeafb196bd/builtin/logical/mongodb/path_creds_create.go#L14
-//
-func isCredential(key string) bool {
-	paths := strings.Split(key, "/")
-	return len(paths) > 2 && paths[1] == "creds"
-}
-
-//
-// Get secret from (in order) :
-// - dynamic secrets if is credential
-// - read from vault api directly
-//
-func (c *Client) getSecret(key string) (secret *vaultapi.Secret, err error) {
-	if isCredential(key) {
-		if value, ok := c.dynamicSecrets[key]; ok {
-			secret = value.Load().(*vaultapi.Secret)
-		} else {
-			secret, err = c.client.Logical().Read(key)
+func (c *Client) lookupBackend(path string) SecretLifecycle {
+	for _, backend := range c.lifecycles {
+		if backend.IsDynamic(path) {
+			return backend
 		}
-	} else {
-		secret, err = c.client.Logical().Read(key)
 	}
 
-	return secret, err
+	return nil
 }
 
 // GetValues queries etcd for keys prefixed by prefix.
@@ -421,7 +196,17 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 
 		log.Debug("getting %s from vault", key)
 
-		secret, err := c.getSecret(key)
+		var secret *v.Secret
+		var err error
+
+		// TODO
+		if backend := c.lookupBackend(key); backend != nil {
+			// dynamic secret
+			secret, err = backend.Lookup(key)
+		} else {
+			// static secret
+			secret, err = c.client.Logical().Read(key)
+		}
 
 		if err != nil {
 			log.Debug("there was an error extracting %s", key)

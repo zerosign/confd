@@ -73,6 +73,8 @@ func init() {
 	flag.StringVar(&config.Username, "username", "", "the username to authenticate as (only used with vault and etcd backends)")
 	flag.StringVar(&config.Password, "password", "", "the password to authenticate with (only used with vault and etcd backends)")
 	flag.BoolVar(&config.Watch, "watch", false, "enable watch support")
+	flag.Var(&config.BackendsConfig.DynamicSecretEngines, "dynamic-secret-engines", "list of all dynamic secret engines lifecycle that want to be supported")
+	flag.Float64Var(&config.BackendsConfig.DynamicSecretTollerance, "dynamic-secret-tollerance", float64(2)/float64(3), "set dynamic secret engine tollerance time for secret to be considered as outdated")
 }
 
 // initConfig initializes the confd configuration by first setting defaults,
@@ -162,13 +164,6 @@ func initConfig() error {
 	}
 	// Initialize the storage client
 	log.Info("Backend set to " + config.Backend)
-
-	//
-	// HACK: forward config Interval to BackendInterval
-	//
-	if config.Interval > 0 {
-		config.BackendInterval = config.Interval
-	}
 
 	if config.Watch {
 		unsupportedBackends := map[string]bool{

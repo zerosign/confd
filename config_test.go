@@ -11,10 +11,11 @@ func TestInitConfigDefaultConfig(t *testing.T) {
 	log.SetLevel("warn")
 	want := Config{
 		BackendsConfig: BackendsConfig{
-			Backend:      "etcd",
-			BackendNodes: []string{"http://127.0.0.1:4001"},
-			Scheme:       "http",
-			Filter:       "*",
+			Backend:                 "etcd",
+			BackendNodes:            []string{"http://127.0.0.1:4001"},
+			Scheme:                  "http",
+			Filter:                  "*",
+			DynamicSecretTollerance: float64(2) / float64(3),
 		},
 		TemplateConfig: TemplateConfig{
 			ConfDir:     "/etc/confd",
@@ -29,6 +30,6 @@ func TestInitConfigDefaultConfig(t *testing.T) {
 		t.Errorf(err.Error())
 	}
 	if !reflect.DeepEqual(want, config) {
-		t.Errorf("initConfig() = %v, want %v", config, want)
+		t.Errorf("initConfig() = \n%+v, want\n %+v\n", config, want)
 	}
 }
